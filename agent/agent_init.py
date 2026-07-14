@@ -1341,6 +1341,10 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    # Per-thread memory: scope the 'memory' tier by the stable
+                    # gateway session key (chat + topic/thread). CLI/cron runs
+                    # have no key and keep the legacy single global MEMORY.md.
+                    scope=agent._gateway_session_key,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:

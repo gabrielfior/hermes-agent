@@ -428,6 +428,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
+            # Shared global tier — rendered as a separate block only when the
+            # store is thread-scoped (otherwise "memory" already IS the global file).
+            global_block = agent._memory_store.format_for_system_prompt("global")
+            if global_block:
+                volatile_parts.append(global_block)
         # USER.md is always included when enabled.
         if agent._user_profile_enabled:
             user_block = agent._memory_store.format_for_system_prompt("user")

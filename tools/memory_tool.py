@@ -26,6 +26,7 @@ Design:
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -55,6 +56,18 @@ logger = logging.getLogger(__name__)
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
+
+
+def _sanitize_scope(scope: str) -> str:
+    """Turn a gateway session key into a filesystem-safe directory slug.
+
+    e.g. 'agent:main:telegram:dm:498299501:72671'
+       -> 'agent_main_telegram_dm_498299501_72671'
+    Deterministic: the same thread always maps to the same directory.
+    """
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope or "").strip("_.")
+    return slug or "default"
+
 
 ENTRY_DELIMITER = "\n§\n"
 
@@ -127,13 +140,18 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
-        self.memory_entries: List[str] = []
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375,
+                 scope: Optional[str] = None):
+        self.memory_entries: List[str] = []   # per-thread MEMORY.md (active when scope is set)
+        self.global_entries: List[str] = []   # shared MEMORY.md (cross-thread tier)
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        # Per-thread scope (sanitized gateway session key). None => no thread tier;
+        # the "memory" target then aliases the shared global file (legacy behavior).
+        self.scope: Optional[str] = _sanitize_scope(scope) if scope else None
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "global": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -166,18 +184,18 @@ class MemoryStore:
         }
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+        """Load USER.md (shared), the global MEMORY.md (shared) and — when a thread
+        scope is set — this thread's MEMORY.md. Capture the system prompt snapshot.
 
-        The frozen snapshot is what enters the system prompt. We scan each
-        entry for injection/promptware patterns at snapshot-build time —
-        ANY hit replaces the entry text in the snapshot with a placeholder
-        like ``[BLOCKED: …]``, so a poisoned-on-disk memory file (supply
-        chain, compromised tool, sister-session write) cannot inject into
-        the system prompt.
-
-        The live ``memory_entries`` / ``user_entries`` lists keep the
-        original text so the user can still SEE poisoned entries via
-        see poisoned entries by inspecting the source files directly, and remove them — silently dropping them would hide the attack from the user.
+        The frozen snapshot is what enters the system prompt. Each entry is
+        scanned for injection/promptware patterns at snapshot-build time — ANY
+        hit replaces the entry text in the snapshot with a ``[BLOCKED: …]``
+        placeholder, so a poisoned-on-disk memory file (supply chain,
+        compromised tool, sister-session write) cannot inject into the system
+        prompt. The live ``memory_entries`` / ``global_entries`` / ``user_entries``
+        lists keep the original text so the user can still SEE poisoned entries
+        by inspecting the source files directly, and remove them — silently
+        dropping them would hide the attack from the user.
 
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
@@ -185,22 +203,31 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.user_entries = self._read_file(self._path_for("user"))
+        self.memory_entries = self._read_file(self._path_for("memory"))
+        # Separate global tier only exists when thread-scoped; without a scope
+        # the 'memory' read above already covered the single MEMORY.md.
+        self.global_entries = self._read_file(self._path_for("global")) if self.scope else []
 
         # Deduplicate entries (preserves order, keeps first occurrence)
-        self.memory_entries = list(dict.fromkeys(self.memory_entries))
+        self.global_entries = list(dict.fromkeys(self.global_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.memory_entries = list(dict.fromkeys(self.memory_entries))
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
-        # can see + remove poisoned entries via the memory tool.
+        # (memory_entries / global_entries / user_entries) keeps the raw text
+        # so the user can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
+        sanitized_global = self._sanitize_entries_for_snapshot(self.global_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
 
-        # Capture frozen snapshot for system prompt injection
+        # Capture frozen snapshot for system prompt injection.
+        # With a scope: two memory blocks (this-thread + shared global).
+        # Without a scope: a single "memory" block backed by the global file
+        # (unchanged legacy behavior); no separate global block.
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
+            "global": self._render_block("global", sanitized_global) if self.scope else "",
             "user": self._render_block("user", sanitized_user),
         }
 
@@ -277,12 +304,23 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _effective_target(self, target: str) -> str:
+        """Without a thread scope there is no separate thread tier: the 'global'
+        target aliases the legacy 'memory' store (single MEMORY.md), preserving
+        exact pre-scope behavior for CLI/cron contexts."""
+        if target == "global" and not self.scope:
+            return "memory"
+        return target
+
+    def _path_for(self, target: str) -> Path:
+        target = self._effective_target(target)
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
-        return mem_dir / "MEMORY.md"
+        if target == "memory" and self.scope:
+            # Per-thread tier — isolated under threads/<scope>/
+            return mem_dir / "threads" / self.scope / "MEMORY.md"
+        return mem_dir / "MEMORY.md"  # shared global tier (and legacy no-scope 'memory')
 
     def _reload_target(self, target: str, *, skip_drift: bool = False) -> Optional[str]:
         """Re-read entries from disk into in-memory state.
@@ -308,17 +346,24 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_file(path, self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
+        target = self._effective_target(target)
         if target == "user":
             return self.user_entries
+        if target == "global":
+            return self.global_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
+        target = self._effective_target(target)
         if target == "user":
             self.user_entries = entries
+        elif target == "global":
+            self.global_entries = entries
         else:
             self.memory_entries = entries
 
@@ -672,9 +717,14 @@ class MemoryStore:
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
         if target == "user":
-            header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+            label = "USER PROFILE (who the user is)"
+        elif target == "global":
+            label = "MEMORY (shared across all threads)"
+        elif self.scope:
+            label = "MEMORY (this thread only — private to this conversation)"
         else:
-            header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
+            label = "MEMORY (your personal notes)"
+        header = f"{label} [{pct}% — {current:,}/{limit:,} chars]"
 
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"
@@ -983,8 +1033,8 @@ def memory_tool(
     if target is None:
         target = "memory"
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in {"memory", "global", "user"}:
+        return tool_error(f"Invalid target '{target}'. Use 'memory', 'global', or 'user'.", success=False)
 
     # --- Batch path -------------------------------------------------------
     if operations:
@@ -1064,8 +1114,9 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
-        "injected into every future turn, so keep entries compact and high-signal.\n\n"
+        "Save durable information to persistent memory that survives across sessions. "
+        "Memory is injected into future turns, so keep it compact and focused on facts "
+        "that will still matter later.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
         "{action, content?, old_text?}). The batch applies atomically and the char limit is "
         "checked only on the FINAL result — so a single call can remove/replace stale entries "
@@ -1073,17 +1124,28 @@ MEMORY_SCHEMA = {
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
         "single lone change.\n\n"
-        "WHEN: save proactively when the user states a preference, correction, or personal "
-        "detail, or you learn a stable fact about their environment, conventions, or workflow. "
-        "Priority: user preferences & corrections > environment facts > procedures. The best "
-        "memory stops the user repeating themselves.\n\n"
-        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
-        "removes or shortens enough stale entries and adds the new one together.\n\n"
-        "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
-        "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
-        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
+        "- User corrects you or says 'remember this' / 'don't do that again'\n"
+        "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
+        "- You discover something about the environment (OS, installed tools, project structure)\n"
+        "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
+        "- You identify a stable fact that will be useful again in future sessions\n\n"
+        "PRIORITY: User preferences and corrections > environment facts > procedural knowledge. "
+        "The most valuable memory prevents the user from having to repeat themselves.\n\n"
+        "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
+        "state to memory; use session_search to recall those from past transcripts.\n"
+        "If you've discovered a new way to do something, solved a problem that could be "
+        "necessary later, save it as a skill with the skill tool.\n\n"
+        "THREE TARGETS (default to 'memory'):\n"
+        "- 'memory': notes private to THIS conversation thread/topic -- task context, project "
+        "conventions, tool quirks, lessons learned here. Default target; keeps threads from "
+        "contaminating each other.\n"
+        "- 'global': facts shared across ALL threads -- use sparingly, only for things that are "
+        "universally true regardless of topic (e.g. the overall machine/agent setup).\n"
+        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n\n"
+        "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
+        "remove (delete -- old_text identifies it).\n\n"
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
         "type": "object",
@@ -1095,8 +1157,12 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "global", "user"],
+                "description": (
+                    "Which memory store: 'memory' (default) for notes private to this "
+                    "conversation thread, 'global' for facts shared across all threads "
+                    "(use sparingly), 'user' for the user profile."
+                )
             },
             "content": {
                 "type": "string",
