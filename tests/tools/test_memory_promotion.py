@@ -7,6 +7,7 @@ from agent.memory_promotion import (
     Promotion, gather_thread_entries, read_global_entries,
     build_prompt, propose_promotions,
     ApplyResult, apply_promotions,
+    Report, run_promotion, effective_apply,
 )
 from tools.memory_tool import MemoryStore
 
@@ -110,3 +111,59 @@ def test_apply_char_limit_overflow_skips(mem_dir):
     assert res.promoted == []
     assert len(res.skipped_overflow) == 1
     assert res.removed == []  # removal skipped when the add fails
+
+
+# --- Task 4: run_promotion + config gating + report -----------------------
+
+def _fake_llm_promoting(fact, scope, entry):
+    payload = ('{"promotions": [{"fact": "%s", "source_scopes": ["%s"], '
+               '"remove": [["%s", "%s"]]}]}' % (fact, scope, scope, entry))
+    return lambda prompt: payload
+
+
+def test_effective_apply_precedence():
+    assert effective_apply({"memory_promotion": {"mode": "apply"}}, None) is True
+    assert effective_apply({"memory_promotion": {"mode": "dry-run"}}, None) is False
+    assert effective_apply({}, None) is False                       # default dry-run
+    assert effective_apply({"memory_promotion": {"mode": "apply"}}, False) is False  # CLI override
+
+
+def test_run_dry_run_writes_nothing(mem_dir, monkeypatch):
+    monkeypatch.setattr("agent.memory_promotion.get_hermes_home", lambda: mem_dir)
+    src = MemoryStore(scope="s1"); src.load_from_disk(); src.add("memory", "ubuntu box")
+    rep = run_promotion(mem_dir, _fake_llm_promoting("machine=ubuntu", "s1", "ubuntu box"),
+                        apply=False)
+    assert rep.dry_run is True
+    assert [p.fact for p in rep.proposals] == ["machine=ubuntu"]
+    assert read_global_entries(mem_dir) == []            # nothing written
+    assert "ubuntu box" in _thread_entries("s1")
+
+
+def test_run_apply_writes(mem_dir, monkeypatch):
+    monkeypatch.setattr("agent.memory_promotion.get_hermes_home", lambda: mem_dir)
+    src = MemoryStore(scope="s1"); src.load_from_disk(); src.add("memory", "ubuntu box")
+    rep = run_promotion(mem_dir, _fake_llm_promoting("machine=ubuntu", "s1", "ubuntu box"),
+                        apply=True)
+    assert rep.dry_run is False
+    assert "machine=ubuntu" in read_global_entries(mem_dir)
+    assert rep.applied.promoted == ["machine=ubuntu"]
+
+
+def test_run_llm_failure_no_writes(mem_dir, monkeypatch):
+    monkeypatch.setattr("agent.memory_promotion.get_hermes_home", lambda: mem_dir)
+    src = MemoryStore(scope="s1"); src.load_from_disk(); src.add("memory", "ubuntu box")
+    def boom(prompt):
+        raise RuntimeError("provider down")
+    rep = run_promotion(mem_dir, boom, apply=True)
+    assert rep.error is not None
+    assert read_global_entries(mem_dir) == []
+
+
+def test_run_writes_report(mem_dir, monkeypatch):
+    monkeypatch.setattr("agent.memory_promotion.get_hermes_home", lambda: mem_dir)
+    src = MemoryStore(scope="s1"); src.load_from_disk(); src.add("memory", "ubuntu box")
+    run_promotion(mem_dir, _fake_llm_promoting("machine=ubuntu", "s1", "ubuntu box"),
+                  apply=True, ts="20260715-000000")
+    report = mem_dir / "logs" / "memory-curator" / "20260715-000000" / "REPORT.md"
+    assert report.is_file()
+    assert "machine=ubuntu" in report.read_text()

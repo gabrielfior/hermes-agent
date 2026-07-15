@@ -8,10 +8,12 @@ docs/superpowers/specs/2026-07-15-memory-thread-global-rollup-design.md
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from hermes_constants import get_hermes_home
 from tools.memory_tool import MemoryStore, get_memory_dir
 
 _read_file = MemoryStore._read_file  # staticmethod: parse a MEMORY.md into entries
@@ -157,3 +159,75 @@ def _remove_thread_entries(remove: List[Tuple[str, str]], res: ApplyResult) -> N
             for e in entries:
                 if e not in kept:
                     res.removed.append((scope, e))
+
+
+def effective_apply(config: dict, cli_flag: Optional[bool]) -> bool:
+    """Resolve whether to apply. Explicit CLI flag wins; else config
+    ``memory_promotion.mode == 'apply'``; default False (dry-run)."""
+    if cli_flag is not None:
+        return cli_flag
+    mode = (config.get("memory_promotion") or {}).get("mode", "dry-run")
+    return str(mode).strip().lower() == "apply"
+
+
+@dataclass
+class Report:
+    proposals: List[Promotion]
+    applied: Optional[ApplyResult]
+    dry_run: bool
+    error: Optional[str] = None
+
+
+def run_promotion(mem_dir: Path, llm_fn: Callable[[str], str], *, apply: bool,
+                  char_limit: int = 2200, ts: str = "run") -> Report:
+    """Gather -> propose -> (backup + apply unless dry-run) -> report.
+
+    Never raises: LLM/parse errors are captured in Report.error with no writes.
+    """
+    try:
+        threads = gather_thread_entries(mem_dir)
+        global_entries = read_global_entries(mem_dir)
+        budget = max(0, char_limit - sum(len(e) for e in global_entries))
+        proposals = propose_promotions(threads, global_entries, budget, llm_fn)
+    except Exception as exc:  # noqa: BLE001 - failure isolation, never raise
+        rep = Report(proposals=[], applied=None, dry_run=not apply, error=str(exc))
+        _safe_write_report(rep, ts)
+        return rep
+
+    applied = None
+    if apply and proposals:
+        gpath = mem_dir / "MEMORY.md"
+        if gpath.is_file():
+            shutil.copy2(gpath, gpath.with_suffix(f".md.bak.{ts}"))
+        applied = apply_promotions(mem_dir, proposals)
+
+    rep = Report(proposals=proposals, applied=applied, dry_run=not apply)
+    _safe_write_report(rep, ts)
+    return rep
+
+
+def write_report(report: Report, ts: str) -> Path:
+    out_dir = get_hermes_home() / "logs" / "memory-curator" / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f"# Memory roll-up — {ts}", "",
+             f"Mode: {'dry-run' if report.dry_run else 'apply'}",
+             f"Error: {report.error or 'none'}", "", "## Proposals"]
+    for p in report.proposals:
+        n = len(p.remove)
+        lines.append(f"- **{p.fact}**  (from {', '.join(p.source_scopes)}; "
+                     f"removes {n} thread entr{'y' if n == 1 else 'ies'})")
+    if report.applied:
+        lines += ["", "## Applied",
+                  f"- promoted: {len(report.applied.promoted)}",
+                  f"- removed thread entries: {len(report.applied.removed)}",
+                  f"- skipped (overflow): {len(report.applied.skipped_overflow)}"]
+    path = out_dir / "REPORT.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _safe_write_report(report: Report, ts: str) -> None:
+    try:
+        write_report(report, ts)
+    except Exception:  # noqa: BLE001 - reporting must never break the run
+        pass
