@@ -6,6 +6,7 @@ import pytest
 from agent.memory_promotion import (
     Promotion, gather_thread_entries, read_global_entries,
     build_prompt, propose_promotions,
+    ApplyResult, apply_promotions,
 )
 from tools.memory_tool import MemoryStore
 
@@ -75,3 +76,37 @@ def test_propose_empty_when_no_threads():
     called = []
     propose_promotions({}, [], 500, lambda p: called.append(1) or "{}")
     assert called == []  # LLM not called when there are no threads
+
+
+# --- Task 3: apply_promotions ---------------------------------------------
+
+def test_apply_moves_fact_to_global_and_removes_thread_copy(mem_dir):
+    src = MemoryStore(memory_char_limit=2000, scope="s1")
+    src.load_from_disk()
+    src.add("memory", "the box runs ubuntu 24.04")
+    proms = [Promotion(fact="machine runs ubuntu 24.04",
+                       source_scopes=["s1"],
+                       remove=[("s1", "the box runs ubuntu 24.04")])]
+    res = apply_promotions(mem_dir, proms)
+    assert res.promoted == ["machine runs ubuntu 24.04"]
+    assert ("s1", "the box runs ubuntu 24.04") in res.removed
+    assert "machine runs ubuntu 24.04" in read_global_entries(mem_dir)
+    assert "the box runs ubuntu 24.04" not in _thread_entries("s1")
+
+
+def test_apply_dedupes_against_existing_global(mem_dir):
+    g = MemoryStore(scope=None)
+    g.load_from_disk()
+    g.add("global", "already here")
+    apply_promotions(mem_dir, [Promotion("already here", ["s1"], [])])
+    assert read_global_entries(mem_dir).count("already here") == 1
+
+
+def test_apply_char_limit_overflow_skips(mem_dir):
+    g = MemoryStore(scope=None)   # default limit 2200
+    g.load_from_disk()
+    g.add("global", "x" * 1900)   # global now ~1900/2200
+    res = apply_promotions(mem_dir, [Promotion("y" * 500, ["s1"], [("s1", "z")])])
+    assert res.promoted == []
+    assert len(res.skipped_overflow) == 1
+    assert res.removed == []  # removal skipped when the add fails

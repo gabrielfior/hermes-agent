@@ -111,3 +111,49 @@ def propose_promotions(thread_entries: Dict[str, List[str]],
                              source_scopes=list(item.get("source_scopes", [])),
                              remove=remove))
     return out
+
+
+@dataclass
+class ApplyResult:
+    promoted: List[str] = field(default_factory=list)
+    removed: List[Tuple[str, str]] = field(default_factory=list)
+    skipped_overflow: List[str] = field(default_factory=list)
+
+
+def apply_promotions(mem_dir: Path, promotions: List[Promotion]) -> ApplyResult:
+    """Add each fact to the global tier (char-limit + scan enforced by
+    MemoryStore.add) and remove the per-thread copies it covers. Move, not
+    copy. Idempotent: facts already in global are skipped but still trigger
+    removal of their redundant per-thread copies."""
+    res = ApplyResult()
+    gstore = MemoryStore(scope=None)
+    gstore.load_from_disk()
+    seen = set(gstore.global_entries)
+    for p in promotions:
+        if p.fact in seen:
+            _remove_thread_entries(p.remove, res)
+            continue
+        add_res = gstore.add("global", p.fact)   # global tier -> MEMORY.md
+        if not add_res.get("success"):
+            res.skipped_overflow.append(p.fact)
+            continue
+        res.promoted.append(p.fact)
+        seen.add(p.fact)
+        _remove_thread_entries(p.remove, res)
+    return res
+
+
+def _remove_thread_entries(remove: List[Tuple[str, str]], res: ApplyResult) -> None:
+    by_scope: Dict[str, List[str]] = {}
+    for scope, entry in remove:
+        by_scope.setdefault(scope, []).append(entry)
+    for scope, entries in by_scope.items():
+        tstore = MemoryStore(scope=scope)
+        tstore.load_from_disk()
+        kept = [e for e in tstore.memory_entries if e not in entries]
+        if kept != tstore.memory_entries:
+            tstore._set_entries("memory", kept)
+            tstore.save_to_disk("memory")
+            for e in entries:
+                if e not in kept:
+                    res.removed.append((scope, e))
