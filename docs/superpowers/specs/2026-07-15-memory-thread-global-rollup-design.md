@@ -35,10 +35,26 @@ global. This feature adds that.
 | Decision | Choice |
 |---|---|
 | Promotion criterion | **LLM-judged** — an LLM decides what is universal |
-| Apply model | **Auto-apply + report** (reversible via backup) |
+| Apply model | **Auto-apply + report**, but **roll out dry-run first** (config-gated) |
 | Structure | Standalone module + CLI + weekly systemd timer |
 | Move vs copy | **Move/dedupe** — add to global, remove redundant per-thread copies |
 | Cadence | **Weekly** |
+
+### Rollout mode (config-gated)
+
+The end state is auto-apply, but the timer **starts in dry-run** so the reports
+can be reviewed before anything is written. A config key controls it:
+
+```yaml
+memory_promotion:
+  mode: dry-run   # dry-run (default): propose + report only, no writes
+                  # apply: perform the roll-up
+```
+
+The weekly timer runs `hermes memory promote` (no flag) and the effective mode
+comes from `memory_promotion.mode`. Flipping to live is a one-line config edit —
+no unit-file edit, no restart (the timer re-reads config each run). Explicit
+`--dry-run` / `--apply` on the CLI override the config for a manual run.
 
 ## Architecture
 
@@ -94,16 +110,19 @@ run_promotion(mem_dir, llm_fn, *, dry_run: bool) -> Report
 ### CLI
 
 `hermes memory promote [--dry-run] [--apply] [--json]`
-- `--dry-run` (default): propose + report only, no writes.
-- `--apply`: perform the roll-up (what the timer runs).
+- No flag: effective mode comes from `memory_promotion.mode` (default `dry-run`).
+- `--dry-run`: force propose + report only, no writes (overrides config).
+- `--apply`: force the roll-up (overrides config).
 - `--json`: machine-readable output.
 
 ### Scheduling
 
 `~/.config/systemd/user/hermes-memory-rollup.{service,timer}`, weekly
 (`OnCalendar=weekly`, `Persistent=true`, `RandomizedDelaySec`), running
-`hermes memory promote --apply`. Same install pattern as the existing
-`hermes-update-check.timer`. Disable = `systemctl --user disable --now`.
+`hermes memory promote` (no flag) so `memory_promotion.mode` governs behavior.
+It therefore **starts in dry-run** — writing only reports until you set
+`mode: apply`. Same install pattern as the existing `hermes-update-check.timer`.
+Disable = `systemctl --user disable --now`.
 
 ## Testing (TDD, fake `llm_fn`)
 
@@ -115,6 +134,7 @@ run_promotion(mem_dir, llm_fn, *, dry_run: bool) -> Report
 6. No-ops: zero threads / single thread / empty files → no writes, clean report.
 7. Failure: `llm_fn` raises or returns invalid JSON → no writes, error in report, non-zero handled.
 8. `apply_promotions` persists through `MemoryStore` (re-read from disk shows the change).
+9. Config-gating: `mode: dry-run` (or unset) → proposals produced but NO writes even when the timer runs; `mode: apply` → writes occur; explicit `--apply`/`--dry-run` override config.
 
 ## Rollback
 
