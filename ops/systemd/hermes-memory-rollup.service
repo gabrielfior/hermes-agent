@@ -1,0 +1,8 @@
+[Unit]
+Description=Roll up universal per-thread memory into global (config-gated; dry-run by default)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/.hermes/hermes-agent
+ExecStart=/home/ubuntu/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main memory promote

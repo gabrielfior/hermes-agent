@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly memory roll-up
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3h
+
+[Install]
+WantedBy=timers.target
