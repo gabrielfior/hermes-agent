@@ -12548,6 +12548,10 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
+    if sub == "promote":
+        from agent.memory_promotion import promote_cli
+        return promote_cli(cli_apply=getattr(args, "promote_apply", None),
+                           as_json=getattr(args, "promote_json", False))
     if sub == "off":
         from hermes_cli.config import load_config, save_config
 

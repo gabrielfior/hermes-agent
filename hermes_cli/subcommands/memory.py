@@ -50,4 +50,15 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default="all",
         help="Which store to reset: 'all' (default), 'memory', or 'user'",
     )
+    _promote = memory_sub.add_parser(
+        "promote",
+        help="Roll up universal per-thread facts into shared/global memory",
+    )
+    _mode = _promote.add_mutually_exclusive_group()
+    _mode.add_argument("--apply", dest="promote_apply", action="store_true",
+                       default=None, help="Force apply (override config mode)")
+    _mode.add_argument("--dry-run", dest="promote_apply", action="store_false",
+                       help="Force dry-run (override config mode)")
+    _promote.add_argument("--json", dest="promote_json", action="store_true",
+                          help="Machine-readable output")
     memory_parser.set_defaults(func=cmd_memory)

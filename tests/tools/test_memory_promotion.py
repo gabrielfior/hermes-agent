@@ -167,3 +167,34 @@ def test_run_writes_report(mem_dir, monkeypatch):
     report = mem_dir / "logs" / "memory-curator" / "20260715-000000" / "REPORT.md"
     assert report.is_file()
     assert "machine=ubuntu" in report.read_text()
+
+
+# --- Task 5: promote_cli ---------------------------------------------------
+
+from agent import memory_promotion as mp
+
+
+def test_promote_cli_uses_config_mode(mem_dir, monkeypatch, capsys):
+    # promote_cli resolves paths via the module-local bindings, so patch those.
+    monkeypatch.setattr("agent.memory_promotion.get_memory_dir", lambda: mem_dir)
+    monkeypatch.setattr("agent.memory_promotion.get_hermes_home", lambda: mem_dir)
+    monkeypatch.setattr(mp, "load_config",
+                        lambda: {"memory_promotion": {"mode": "dry-run"}})
+    monkeypatch.setattr(mp, "default_llm_fn", lambda prompt: '{"promotions": []}')
+    src = MemoryStore(scope="s1"); src.load_from_disk(); src.add("memory", "x")
+    rc = mp.promote_cli(cli_apply=None, as_json=False)
+    assert rc == 0
+    assert "dry-run" in capsys.readouterr().out.lower()
+
+
+def test_promote_cli_apply_flag_overrides_config(mem_dir, monkeypatch, capsys):
+    monkeypatch.setattr("agent.memory_promotion.get_memory_dir", lambda: mem_dir)
+    monkeypatch.setattr("agent.memory_promotion.get_hermes_home", lambda: mem_dir)
+    monkeypatch.setattr(mp, "load_config",
+                        lambda: {"memory_promotion": {"mode": "dry-run"}})
+    monkeypatch.setattr(mp, "default_llm_fn",
+                        lambda prompt: _fake_llm_promoting("g=1", "s1", "e1")(prompt))
+    src = MemoryStore(scope="s1"); src.load_from_disk(); src.add("memory", "e1")
+    rc = mp.promote_cli(cli_apply=True, as_json=False)   # --apply overrides config dry-run
+    assert rc == 0
+    assert "g=1" in read_global_entries(mem_dir)

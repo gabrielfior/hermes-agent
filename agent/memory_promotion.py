@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
 from tools.memory_tool import MemoryStore, get_memory_dir
 
@@ -231,3 +235,40 @@ def _safe_write_report(report: Report, ts: str) -> None:
         write_report(report, ts)
     except Exception:  # noqa: BLE001 - reporting must never break the run
         pass
+
+
+def default_llm_fn(prompt: str) -> str:
+    """Production LLM call: one-shot, non-interactive `hermes chat` against the
+    configured default model. Subprocess keeps the roll-up decoupled from the
+    running gateway; weekly cadence makes the overhead irrelevant."""
+    repo = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "chat", "-q", prompt,
+         "-Q", "--yolo", "--max-turns", "1", "--ignore-rules"],
+        capture_output=True, text=True, timeout=180, cwd=str(repo),
+    )
+    return proc.stdout or ""
+
+
+def promote_cli(*, cli_apply: Optional[bool], as_json: bool) -> int:
+    """`hermes memory promote` entry point. Resolves mode from config unless a
+    CLI flag overrides, runs the roll-up, prints a summary. Returns exit code."""
+    apply = effective_apply(load_config(), cli_apply)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    rep = run_promotion(get_memory_dir(), default_llm_fn, apply=apply, ts=ts)
+    if as_json:
+        print(json.dumps({
+            "mode": "apply" if apply else "dry-run",
+            "proposals": [p.fact for p in rep.proposals],
+            "promoted": list(rep.applied.promoted) if rep.applied else [],
+            "error": rep.error,
+        }))
+    else:
+        mode = "apply" if apply else "dry-run"
+        summary = f"Memory roll-up ({mode}): {len(rep.proposals)} proposal(s)."
+        if rep.error:
+            summary += f" ERROR: {rep.error}"
+        print(summary)
+        for p in rep.proposals:
+            print(f"  - {p.fact}")
+    return 1 if rep.error else 0
